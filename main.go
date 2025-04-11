@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"strconv"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -20,46 +21,64 @@ type RequestData struct {
 	Replicas string `json:"replicas"`
 }
 
-type MyPod struct {
-	Port string
-	Ip   string
+type Deployment struct {
+	HostPort           string `json:"host_port"`
+	ContainerPortSpace int    `json:"container_port_space"`
+	Image              string `json:"image"`
+	Replicas           int    `json:"replicas"`
+	Name               string `json:"name"`
+	ID                 int
 }
 
-func deploy(count uint32) {
+type Container struct {
+	ID           string
+	Name         string
+	Port         string
+	DeploymentID int
+	Ip           string
+}
+
+func deploy(deployment Deployment) {
 	apiClient, err := client.NewClientWithOpts(client.FromEnv)
 	if err != nil {
 		panic(err)
 	}
 
 	// Define exposed port
-	exposedPort, _ := nat.NewPort("tcp", "80")
-
-	// Container config
-	config := &container.Config{
-		Image: "nginx:latest",
-		ExposedPorts: nat.PortSet{
-			exposedPort: struct{}{},
-		},
-	}
-
-	hostConfig := &container.HostConfig{
-		PortBindings: nat.PortMap{
-			exposedPort: []nat.PortBinding{
-				{
-					HostIP:   "0.0.0.0",
-					HostPort: "8080",
-				},
-			},
-		},
-	}
+	exposedPort, _ := nat.NewPort("tcp", deployment.HostPort)
 
 	// Platform: leave nil unless you want to target ARM/amd64 specifically
 	var platform *ocispec.Platform = nil
 
 	networkingConfig := &network.NetworkingConfig{}
 
-	for idx := range count {
-		containerName := fmt.Sprintf("nginx-0%c", idx)
+	var containerResponseSlice []container.CreateResponse
+
+	// Container config
+	config := &container.Config{
+		Image: deployment.Image,
+		ExposedPorts: nat.PortSet{
+			exposedPort: struct{}{},
+		},
+		Labels: map[string]string{"deployment": deployment.Name},
+	}
+
+	var containers []Container
+
+	for i := 0; i < deployment.Replicas; i++ {
+		internalPort := strconv.Itoa(i + deployment.ContainerPortSpace)
+		hostConfig := &container.HostConfig{
+			PortBindings: nat.PortMap{
+				exposedPort: []nat.PortBinding{
+					{
+						HostIP:   "0.0.0.0",
+						HostPort: internalPort,
+					},
+				},
+			},
+		}
+
+		containerName := fmt.Sprintf("nginx-0%d", i)
 		containerCreate, err := apiClient.ContainerCreate(
 			context.Background(),
 			config,
@@ -68,21 +87,34 @@ func deploy(count uint32) {
 			platform,
 			containerName,
 		)
-	}
 
-	if err != nil {
-		panic(err)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Println("Container create:", containerCreate)
+
+		containerResponseSlice = append(containerResponseSlice, containerCreate)
+
+		containers = append(containers, Container{
+			Name: containerName,
+			Port: internalPort,
+			ID:   containerCreate.ID,
+		})
 	}
 
 	// https: //github.com/docker/docker/blob/v28.0.4/client/container_create.go#L20
-	fmt.Println("Container create:", containerCreate)
+	for _, container := range containers {
+		err = apiClient.ContainerStart(context.Background(), container.ID, container.StartOptions{})
 
-	err = apiClient.ContainerStart(context.Background(), containerCreate.ID, container.StartOptions{})
+		if err != nil {
+			panic(err)
+		}
 
-	if err != nil {
-		panic(err)
-	} else {
-		fmt.Printf("Container with id: %s started ...", containerCreate.ID)
+		containerInspec, _ := apiClient.ContainerInspect(context.Background(), container.ID)
+
+		fmt.Printf("Container with id: %s started ...\n", container.ID)
+
 	}
 }
 
@@ -95,41 +127,38 @@ func runIptablesRule(args ...string) error {
 	return nil
 }
 
-func loadBalance(containerIps []MyPod) {
-	// Rule 1: 33% chance to IP1
-	dest1 := fmt.Sprintf("%s:%s", containerIps[0].Port, containerIps[0].Ip)
-	dest2 := fmt.Sprintf("%s:%s", containerIps[1].Port, containerIps[1].Ip)
-	dest3 := fmt.Sprintf("%s:%s", containerIps[2].Port, containerIps[2].Ip)
+func loadBalance(containers []Container, deployment Deployment) {
+	remaining := 1.0
+	for i := 0; i < len(containers); i++ {
+		if i == len(containers)-1 {
+			// Final fallback
+			err := runIptablesRule(
+				"-t", "nat", "-A", "PREROUTING",
+				"-p", "tcp", "--dport", deployment.HostPort,
+				"-j", "DNAT", "--to-destination", containers[i].Ip+containers[i].Port,
+			)
 
-	err := runIptablesRule(
-		"-t", "nat", "-A", "PREROUTING",
-		"-p", "tcp", "--dport", "80",
-		"-m", "statistic", "--mode", "random", "--probability", "0.33",
-		"-j", "DNAT", "--to-destination", dest1,
-	)
-	if err != nil {
-		panic(err)
-	}
+			if err != nil {
+				panic(err)
+			}
 
-	// Rule 2: 50% of remaining (≈33%) to IP2
-	err = runIptablesRule(
-		"-t", "nat", "-A", "PREROUTING",
-		"-p", "tcp", "--dport", "80",
-		"-m", "statistic", "--mode", "random", "--probability", "0.5",
-		"-j", "DNAT", "--to-destination", dest2,
-	)
-	if err != nil {
-		panic(err)
-	}
+			break
+		}
 
-	// Rule 3: fallback to IP3 (~34%)
-	err = runIptablesRule(
-		"-t", "nat", "-A", "PREROUTING",
-		"-p", "tcp", "--dport", "80",
-		"-j", "DNAT", "--to-destination", dest3,
-	)
-	if err != nil {
-		panic(err)
+		prob := 1.0 / float64(len(containers)-i)
+		probStr := fmt.Sprintf("%.6f", prob)
+		err := runIptablesRule(
+			"-t", "nat", "-A", "PREROUTING",
+			"-p", "tcp", "--dport", deployment.HostPort,
+			"-m", "statistic", "--mode", "random", "--probability", probStr,
+			"-j", "DNAT", "--to-destination", containers[i].Ip+containers[i].Port,
+		)
+
+		if err != nil {
+			panic(err)
+		}
+		remaining -= prob
+
 	}
 }
 
@@ -139,7 +168,7 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var data RequestData
+	var data Deployment
 	err := json.NewDecoder(r.Body).Decode(&data)
 	if err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
@@ -149,9 +178,11 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 	// Do something with the data
 	fmt.Printf("Received: %+v\n", data)
 
+	deploy(data)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": fmt.Sprintf("Containers started, %s!", data.Image),
+		"message": fmt.Sprintf("Containers started, %s!", data.Name),
 	})
 }
 
