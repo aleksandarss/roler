@@ -151,7 +151,7 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
-		"message": fmt.Sprintf("Hello, %s!", data.Name),
+		"message": fmt.Sprintf("Containers started, %s!", data.Image),
 	})
 }
 
