@@ -39,17 +39,15 @@ func deploy(deployment Deployment) {
 		panic(err)
 	}
 
-	// Define exposed port
 	exposedPort, _ := nat.NewPort("tcp", deployment.HostPort)
 
-	// Platform: leave nil unless you want to target ARM/amd64 specifically
+	// TODO: for arm64 this needs to be defined
 	var platform *ocispec.Platform = nil
 
 	networkingConfig := &network.NetworkingConfig{}
 
 	var containerResponseSlice []container.CreateResponse
 
-	// Container config
 	config := &container.Config{
 		Image: deployment.Image,
 		ExposedPorts: nat.PortSet{
@@ -135,7 +133,6 @@ func loadBalance(containers []Container, deployment Deployment) {
 		containerAddress := fmt.Sprintf("%s:%s", containers[i].Ip, containers[i].Port)
 
 		if i == len(containers)-1 {
-			// Final fallback
 			err := runIptablesRule(
 				"-t", "nat", "-A", "PREROUTING",
 				"-p", "tcp", "--dport", deployment.HostPort,
@@ -179,7 +176,6 @@ func deployHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Do something with the data
 	fmt.Printf("Received: %+v\n", data)
 
 	deploy(data)
