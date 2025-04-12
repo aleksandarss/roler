@@ -16,11 +16,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-type RequestData struct {
-	Image    string `json:"image"`
-	Replicas string `json:"replicas"`
-}
-
 type Deployment struct {
 	HostPort           string `json:"host_port"`
 	ContainerPortSpace int    `json:"container_port_space"`
@@ -104,17 +99,23 @@ func deploy(deployment Deployment) {
 	}
 
 	// https: //github.com/docker/docker/blob/v28.0.4/client/container_create.go#L20
-	for _, container := range containers {
-		err = apiClient.ContainerStart(context.Background(), container.ID, container.StartOptions{})
+	for i := range containers {
+		err = apiClient.ContainerStart(context.Background(), containers[i].ID, container.StartOptions{})
 
 		if err != nil {
 			panic(err)
 		}
 
-		containerInspec, _ := apiClient.ContainerInspect(context.Background(), container.ID)
+		fmt.Printf("Container with id: %s started ...\n", containers[i].ID)
 
-		fmt.Printf("Container with id: %s started ...\n", container.ID)
+		containerInspec, _ := apiClient.ContainerInspect(context.Background(), containers[i].ID)
 
+		containers[i].Ip = containerInspec.NetworkSettings.DefaultNetworkSettings.IPAddress
+
+	}
+
+	if deployment.Replicas > 1 {
+		loadBalance(containers, deployment)
 	}
 }
 
@@ -129,13 +130,16 @@ func runIptablesRule(args ...string) error {
 
 func loadBalance(containers []Container, deployment Deployment) {
 	remaining := 1.0
+
 	for i := 0; i < len(containers); i++ {
+		containerAddress := fmt.Sprintf("%s:%s", containers[i].Ip, containers[i].Port)
+
 		if i == len(containers)-1 {
 			// Final fallback
 			err := runIptablesRule(
 				"-t", "nat", "-A", "PREROUTING",
 				"-p", "tcp", "--dport", deployment.HostPort,
-				"-j", "DNAT", "--to-destination", containers[i].Ip+containers[i].Port,
+				"-j", "DNAT", "--to-destination", containerAddress,
 			)
 
 			if err != nil {
@@ -151,7 +155,7 @@ func loadBalance(containers []Container, deployment Deployment) {
 			"-t", "nat", "-A", "PREROUTING",
 			"-p", "tcp", "--dport", deployment.HostPort,
 			"-m", "statistic", "--mode", "random", "--probability", probStr,
-			"-j", "DNAT", "--to-destination", containers[i].Ip+containers[i].Port,
+			"-j", "DNAT", "--to-destination", containerAddress,
 		)
 
 		if err != nil {
